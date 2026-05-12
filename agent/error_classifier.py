@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -84,6 +85,90 @@ class ClassifiedError:
     def is_auth(self) -> bool:
         return self.reason in (FailoverReason.auth, FailoverReason.auth_permanent)
 
+
+def extract_retry_after_seconds(error: Any) -> Optional[float]:
+    """Extract Retry-After seconds from an exception without exposing payloads."""
+    retry_after = getattr(error, "retry_after", None)
+    if retry_after not in (None, ""):
+        try:
+            return max(float(retry_after), 0.0)
+        except (TypeError, ValueError):
+            pass
+
+    body = getattr(error, "body", None)
+    payload = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(payload, dict) and isinstance(body, dict):
+        payload = body
+    if isinstance(payload, dict):
+        retry_after = payload.get("retry_after") or payload.get("retryAfter")
+        if retry_after not in (None, ""):
+            try:
+                return max(float(retry_after), 0.0)
+            except (TypeError, ValueError):
+                pass
+
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers and hasattr(headers, "get"):
+        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        if retry_after not in (None, ""):
+            try:
+                return max(float(retry_after), 0.0)
+            except (TypeError, ValueError):
+                pass
+
+    match = re.search(r"retry(?:_|-|\s*)after[:=\s]+(\d+(?:\.\d+)?)", str(error), re.IGNORECASE)
+    if match:
+        try:
+            return max(float(match.group(1)), 0.0)
+        except (TypeError, ValueError):
+            pass
+
+    return None
+
+
+def classify_rate_limit_source(
+    *,
+    provider: str = "",
+    model: str = "",
+    error: Any = None,
+    service: str = "",
+) -> str:
+    """Return a human-readable source label for rate-limit failures."""
+    service_lower = (service or "").strip().lower()
+    provider_lower = (provider or "").strip().lower()
+    model_lower = (model or "").strip().lower()
+    error_lower = str(error or "").lower()
+    combined = " ".join(part for part in (service_lower, provider_lower, model_lower, error_lower) if part)
+
+    if "telegram" in combined:
+        return "Telegram rate limit"
+    if "elevenlabs" in combined or service_lower == "tts_elevenlabs":
+        return "ElevenLabs rate limit"
+    if "openai-codex" in combined or provider_lower == "codex" or "codex" in provider_lower:
+        return "Codex or ChatGPT usage limit"
+    if "anthropic" in combined or "claude" in combined:
+        return "Claude API rate limit"
+    return "AI provider rate limit"
+
+
+def format_rate_limit_failure(
+    *,
+    provider: str = "",
+    model: str = "",
+    error: Any = None,
+    service: str = "",
+) -> str:
+    """Build a short, safe message for logs and user-facing fallbacks."""
+    source = classify_rate_limit_source(provider=provider, model=model, error=error, service=service)
+    retry_after = extract_retry_after_seconds(error)
+    if retry_after is None:
+        return source
+    if retry_after.is_integer():
+        retry_text = f"{int(retry_after)}s"
+    else:
+        retry_text = f"{retry_after:.1f}s"
+    return f"{source}. Retry after {retry_text}"
 
 
 # ── Provider-specific patterns ──────────────────────────────────────────

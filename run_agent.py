@@ -129,7 +129,11 @@ from tools.browser_tool import cleanup_browser
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import StreamingContextScrubber, build_memory_context_block, sanitize_context
 from agent.retry_utils import jittered_backoff
-from agent.error_classifier import classify_api_error, FailoverReason
+from agent.error_classifier import (
+    classify_api_error,
+    FailoverReason,
+    format_rate_limit_failure,
+)
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
@@ -12156,13 +12160,22 @@ class AIAgent:
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
                     _error_summary = self._summarize_api_error(api_error)
+                    _rate_limit_summary = None
+                    if classified.reason == FailoverReason.rate_limit:
+                        _rate_limit_summary = format_rate_limit_failure(
+                            provider=getattr(self, "provider", ""),
+                            model=getattr(self, "model", ""),
+                            error=api_error,
+                        )
+                    _safe_error_summary = _rate_limit_summary or _error_summary
                     logger.warning(
-                        "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
+                        "API call failed (attempt %s/%s) error_type=%s %s summary=%s rate_limit_source=%s",
                         retry_count,
                         max_retries,
                         error_type,
                         self._client_log_context(),
-                        _error_summary,
+                        _safe_error_summary,
+                        _rate_limit_summary or "",
                     )
 
                     _provider = getattr(self, "provider", "unknown")
@@ -12172,8 +12185,10 @@ class AIAgent:
                     self._vprint(f"{self.log_prefix}⚠️  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}", force=True)
                     self._vprint(f"{self.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                     self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
-                    self._vprint(f"{self.log_prefix}   📝 Error: {_error_summary}", force=True)
-                    if status_code and status_code < 500:
+                    self._vprint(f"{self.log_prefix}   📝 Error: {_safe_error_summary}", force=True)
+                    if _rate_limit_summary:
+                        self._vprint(f"{self.log_prefix}   🚦 Rate limit source: {_rate_limit_summary}", force=True)
+                    if status_code and status_code < 500 and not _rate_limit_summary:
                         _err_body = getattr(api_error, "body", None)
                         _err_body_str = str(_err_body)[:300] if _err_body else None
                         if _err_body_str:
@@ -12700,10 +12715,18 @@ class AIAgent:
                             primary_recovery_attempted = False
                             continue
                         _final_summary = self._summarize_api_error(api_error)
+                        _safe_rate_limit_summary = None
                         if is_rate_limited:
-                            self._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
+                            _safe_rate_limit_summary = format_rate_limit_failure(
+                                provider=getattr(self, "provider", ""),
+                                model=getattr(self, "model", ""),
+                                error=api_error,
+                            )
+                            _final_summary = _safe_rate_limit_summary
+                        if is_rate_limited:
+                            self._emit_status(f"❌ Rate limited after {max_retries} retries: {_final_summary}")
                         else:
-                            self._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
+                            self._emit_status(f"❌ API failed after {max_retries} retries: {_final_summary}")
                         self._vprint(f"{self.log_prefix}   💀 Final error: {_final_summary}", force=True)
 
                         # Detect SSE stream-drop pattern (e.g. "Network
@@ -12736,11 +12759,12 @@ class AIAgent:
                             )
 
                         logging.error(
-                            "%sAPI call failed after %s retries. %s | provider=%s model=%s msgs=%s tokens=~%s",
+                            "%sAPI call failed after %s retries. %s | provider=%s model=%s msgs=%s tokens=~%s rate_limit_source=%s",
                             self.log_prefix, max_retries, _final_summary,
                             _provider, _model, len(api_messages), f"{approx_tokens:,}",
+                            _safe_rate_limit_summary or "",
                         )
-                        if api_kwargs is not None:
+                        if api_kwargs is not None and not is_rate_limited:
                             self._dump_api_request_debug(
                                 api_kwargs, reason="max_retries_exhausted", error=api_error,
                             )

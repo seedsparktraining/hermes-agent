@@ -5,6 +5,9 @@ from agent.error_classifier import (
     ClassifiedError,
     FailoverReason,
     classify_api_error,
+    classify_rate_limit_source,
+    extract_retry_after_seconds,
+    format_rate_limit_failure,
     _extract_status_code,
     _extract_error_body,
     _extract_error_code,
@@ -1164,3 +1167,30 @@ class TestRateLimitErrorWithoutStatusCode:
         e.status_code = None
         result = classify_api_error(e, provider="copilot", model="gpt-4o")
         assert result.reason != FailoverReason.rate_limit
+
+class FakeResponse:
+    def __init__(self, headers):
+        self.headers = headers
+
+
+def test_retry_after_extraction_from_attribute_and_headers():
+    attr_error = MockAPIError("rate limited")
+    attr_error.retry_after = 12
+    assert extract_retry_after_seconds(attr_error) == 12
+
+    header_error = MockAPIError("429")
+    header_error.response = FakeResponse({"Retry-After": "3.5"})
+    assert extract_retry_after_seconds(header_error) == 3.5
+
+
+def test_rate_limit_source_labels_are_specific_and_short():
+    assert classify_rate_limit_source(provider="openai-codex", error="HTTP 429") == "Codex or ChatGPT usage limit"
+    assert classify_rate_limit_source(provider="anthropic", error="HTTP 429") == "Claude API rate limit"
+    assert classify_rate_limit_source(error="ElevenLabs 429 too many requests") == "ElevenLabs rate limit"
+    assert classify_rate_limit_source(service="telegram", error="Retry after 4") == "Telegram rate limit"
+
+
+def test_formatted_rate_limit_message_includes_retry_after_without_raw_payload():
+    e = MockAPIError("HTTP 429: secret payload should not be echoed")
+    e.response = FakeResponse({"retry-after": "7"})
+    assert format_rate_limit_failure(error=e, provider="openai-codex") == "Codex or ChatGPT usage limit. Retry after 7s"

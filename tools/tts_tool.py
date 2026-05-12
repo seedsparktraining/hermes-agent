@@ -72,6 +72,7 @@ def get_env_value(name, default=None):
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import managed_nous_tools_enabled, prefers_gateway, resolve_openai_audio_api_key
 from tools.xai_http import hermes_xai_user_agent
+from agent.error_classifier import format_rate_limit_failure
 
 # ---------------------------------------------------------------------------
 # Lazy imports -- providers are imported only when actually used to avoid
@@ -1792,6 +1793,18 @@ def text_to_speech_tool(
         return tool_error(error_msg, success=False)
     except Exception as e:
         # Unexpected errors
+        err_lower = str(e).lower()
+        status_code = getattr(e, "status_code", None)
+        if provider == "elevenlabs" and (
+            status_code == 429
+            or getattr(e, "retry_after", None) is not None
+            or "429" in err_lower
+            or "rate limit" in err_lower
+            or "too many requests" in err_lower
+        ):
+            error_msg = format_rate_limit_failure(error=e, service="elevenlabs")
+            logger.error("TTS generation failed: %s", error_msg)
+            return tool_error(error_msg, success=False)
         error_msg = f"TTS generation failed ({provider}): {e}"
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)

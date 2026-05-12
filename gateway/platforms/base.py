@@ -2218,6 +2218,15 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
+        error_lower = error_str.lower()
+        if "telegram rate limit" in error_lower:
+            logger.error("[%s] Telegram send failed: %s", self.name, error_str)
+            try:
+                await self.send(chat_id=chat_id, content=f"⚠️ {error_str}.", reply_to=reply_to, metadata=metadata)
+            except Exception as notify_err:
+                logger.debug("[%s] Could not send Telegram rate-limit notice: %s", self.name, notify_err)
+            return result
+
         is_network = result.retryable or self._is_retryable_error(error_str)
 
         # Timeout errors are not safe to retry (message may have been
@@ -2251,7 +2260,7 @@ class BasePlatformAdapter(ABC):
                 logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
                 notice = (
                     "\u26a0\ufe0f Message delivery failed after multiple attempts. "
-                    "Please try again \u2014 your request was processed but the response could not be sent."
+                    "Please try again. Your request was processed, but the response could not be sent."
                 )
                 try:
                     await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)

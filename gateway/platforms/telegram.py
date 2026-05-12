@@ -85,6 +85,7 @@ from gateway.platforms.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace
+from agent.error_classifier import format_rate_limit_failure
 
 
 def check_telegram_requirements() -> bool:
@@ -1285,17 +1286,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception as send_err:
                         retry_after = getattr(send_err, "retry_after", None)
                         if retry_after is not None or "retry after" in str(send_err).lower():
+                            rate_limit_msg = format_rate_limit_failure(error=send_err, service="telegram")
                             if _send_attempt < 2:
                                 wait = float(retry_after) if retry_after is not None else 1.0
                                 logger.warning(
-                                    "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
+                                    "[%s] %s on send (attempt %d/3), retrying in %.1fs",
                                     self.name,
+                                    rate_limit_msg,
                                     _send_attempt + 1,
                                     wait,
-                                    send_err,
                                 )
                                 await asyncio.sleep(wait)
                                 continue
+                            logger.error("[%s] %s on send", self.name, rate_limit_msg)
                         raise
                 message_ids.append(str(msg.message_id))
             
@@ -1306,13 +1309,19 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             
         except Exception as e:
-            logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
-            # TimedOut means the request may have reached Telegram —
+            err_str = str(e).lower()
+            is_rate_limited = getattr(e, "retry_after", None) is not None or "retry after" in err_str or "429" in err_str
+            if is_rate_limited:
+                error_msg = format_rate_limit_failure(error=e, service="telegram")
+                logger.error("[%s] Failed to send Telegram message: %s", self.name, error_msg)
+            else:
+                logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
+                error_msg = str(e)
+            # TimedOut means the request may have reached Telegram --
             # mark as non-retryable so _send_with_retry() doesn't re-send.
             _to = locals().get("_TimedOut")
-            err_str = str(e).lower()
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
-            return SendResult(success=False, error=str(e), retryable=not is_timeout)
+            return SendResult(success=False, error=error_msg, retryable=(not is_timeout and not is_rate_limited))
 
     async def edit_message(
         self,
@@ -1372,12 +1381,13 @@ class TelegramAdapter(BasePlatformAdapter):
             retry_after = getattr(e, "retry_after", None)
             if retry_after is not None or "retry after" in err_str:
                 wait = retry_after if retry_after else 1.0
+                rate_limit_msg = format_rate_limit_failure(error=e, service="telegram")
                 logger.warning(
-                    "[%s] Telegram flood control, waiting %.1fs",
-                    self.name, wait,
+                    "[%s] %s on edit",
+                    self.name, rate_limit_msg,
                 )
                 if wait > 5.0:
-                    return SendResult(success=False, error=f"flood_control:{wait}")
+                    return SendResult(success=False, error=rate_limit_msg)
                 await asyncio.sleep(wait)
                 try:
                     await self._bot.edit_message_text(
